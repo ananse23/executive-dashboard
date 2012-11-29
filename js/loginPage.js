@@ -24,7 +24,7 @@ dojo.require("esri.layers.FeatureLayer");
 dojo.require("esri.tasks.locator");
 dojo.require("esri.tasks.geometry");
 dojo.require("esri.arcgis.utils");
-dojo.require("esri.arcgis.Portal");
+dojo.require("js.LGMockPortal");  // portal mock
 
 var authenticatedGroup; //variable for storing the group link for authentication
 var authenticatedLinks; //variable for storing the links for token generation
@@ -62,11 +62,11 @@ var share;
 //function to call when the application starts
 function Init() {
     esri.config.defaults.io.proxyUrl = "proxy.ashx";
-    esriConfig.defaults.io.alwaysUseProxy = false;
+    esriConfig.defaults.io.alwaysUseProxy = true;  // portal mock
     esriConfig.defaults.io.timeout = 180000;
 
     // Create the portal
-    portal = new esri.arcgis.Portal(portalUrl);
+    portal = new js.LGMockPortal(portalUrl);  // portal mock
 
     dojo.xhrGet({
         url: "errorMessages.xml",
@@ -233,6 +233,7 @@ function AuthenticateUser() {
 
 //function to find the authenticated group
 function FindArcGISGroup() {
+    ShowProgressIndicator();
     var params = {
         q: 'group:' + authenticatedGroup,
         num: 100  // max allowed value
@@ -480,6 +481,7 @@ function PopulateIndicatorData(keyIndicators, val, indicatorState, orderedLayer,
                     if (keyIndicators.length == val) {
                         CreateLayerPods(orderedLayer, token, groupdata, indicatorState);
                         PopulateNews(dojo.byId("btnNews"));
+                        HideProgressIndicator();
                     }
                     PopulateIndicatorData(keyIndicators, val, indicatorState, orderedLayer, token, groupdata);
                 },

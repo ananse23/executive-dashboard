@@ -1,4 +1,4 @@
-<%@ WebHandler Language="C#" Class="proxy" %>
+﻿<%@ WebHandler Language="C#" Class="proxy" %>
 /*
  | Version 10.1.1
  | Copyright 2012 Esri
@@ -22,159 +22,318 @@
   url, etc.
 */
 using System;
-using System.Drawing;
 using System.IO;
 using System.Web;
 using System.Collections.Generic;
 using System.Text;
 using System.Xml.Serialization;
 using System.Web.Caching;
+//============================================================================================================================//
 
 /// <summary>
 /// Forwards requests to an ArcGIS Server REST resource. Uses information in
 /// the proxy.config file to determine properties of the server.
 /// </summary>
-public class proxy : IHttpHandler {
+public class proxy : IHttpHandler
+{
+    const bool cShowAuthXHeaders = true;
 
-    public void ProcessRequest (HttpContext context) {
-
+    public void ProcessRequest (HttpContext context)
+    {
+        HttpRequest originalRequest = context.Request;
         HttpResponse response = context.Response;
 
-        // Get the URL requested by the client (take the entire querystring at once
-        //  to handle the case of the URL itself containing querystring parameters)
-        string uri = context.Request.Url.Query.Substring(1);
-
-        // Get token, if applicable, and append to the request
-        string token = getTokenFromConfigFile(uri);
-        if (!String.IsNullOrEmpty(token))
+        // Read config file
+        ProxyConfig config = ProxyConfig.GetCurrentConfig();
+        if(null == config)
         {
-            if (uri.Contains("?"))
-                uri += "&token=" + token;
-            else
-                uri += "?token=" + token;
+            response.StatusCode = 500;
+            response.StatusDescription = "Proxy configuration not available";
+            response.End();
+            return;
         }
 
-        System.Net.HttpWebRequest req = (System.Net.HttpWebRequest)System.Net.HttpWebRequest.Create(uri);
+        // Check that the application's server matches the config file
+        string applicationURL = originalRequest.Url.Scheme + "://" + originalRequest.Url.Host;
+        string[] segs = originalRequest.Url.Segments;
+        for(int i = 0; i < (segs.Length - 1); ++i)
+        {
+            applicationURL += segs[i];
+        }
+        applicationURL = applicationURL.ToLower();
+        if(applicationURL.EndsWith("/")) applicationURL = applicationURL.Substring(0, applicationURL.Length - 1);
 
-        //code added to use default credentails for authenticating the request via proxy
-        req.UseDefaultCredentials = true;
-        req.Credentials = System.Net.CredentialCache.DefaultCredentials;
+        string configAppURL = config.applicationURL.ToLower();
+        if (configAppURL.EndsWith("/")) configAppURL = configAppURL.Substring(0, configAppURL.Length - 1);
 
-        req.Method = context.Request.HttpMethod;
-        req.ServicePoint.Expect100Continue = false;
+        if (applicationURL != configAppURL)
+        {
+            response.StatusCode = 500;
+            response.StatusDescription = "Unsupported application URL";
+            response.End();
+            return;
+        }
+
+        // Get the URL requested by the client (take the entire querystring at once to handle the case of the
+        // URL itself containing querystring parameters); lop off initial question mark of query string, then
+        // lop off http*:// so that we can handle both unsecure and secure services
+        string dataURL = 1 < originalRequest.Url.Query.Length ? originalRequest.Url.Query.Substring(1) : "";
+        int iProtocol = dataURL.IndexOf("//");
+        string testDataURL = (0 <= iProtocol? dataURL.Substring(iProtocol + 2) : dataURL).ToLower();
+
+        // Check that the data URL matches the config file
+        var ok = false;
+        var authenticate = true;
+        foreach(dataUrlPrefix item in config.dataUrlPrefixes)
+        {
+            ok |= testDataURL.StartsWith(item.url.ToLower());
+            if (ok)
+            {
+                if(null != item.authenticate && "false" == item.authenticate.ToLower())
+                {
+                    authenticate = false;
+                }
+                break;
+            }
+        }
+        if (!ok)
+        {
+            response.StatusCode = 500;
+            response.StatusDescription = "Unsupported data URL";
+            response.End();
+            return;
+        }
+
+        // If we need to authenticate, can we get the authentication spec from the cache?
+        string username = "";
+        bool usedCache = true;//???
+        string authExpiration = "";//???
+        AuthenticationSpec authSpec = null;
+        if(authenticate)
+        {
+            authSpec = HttpRuntime.Cache["authentication"] as AuthenticationSpec;
+            if (authSpec == null)
+            {
+                usedCache = false;//???
+                // No spec available--we'll have to generate one
+
+                // Pick a username; we can have multiple to spread out the load
+                string[] usernames = config.username.Split(new Char[] {','});
+                username = usernames[0];
+                if(1 < usernames.Length)
+                {
+                    username = usernames[(new Random()).Next(usernames.Length)];
+                }
+
+                // Post the authentication request
+                System.Net.HttpWebRequest authenticationReq =
+                    (System.Net.HttpWebRequest)System.Net.HttpWebRequest.Create(config.authenticationUrl);
+                authenticationReq.Method = "POST";
+                authenticationReq.ContentType = "application/x-www-form-urlencoded; charset=UTF-8";
+                authenticationReq.ServicePoint.Expect100Continue = false;
+
+                string postData =
+                    "referer=" + config.applicationURL +
+                    "&username=" + username +
+                    "&password=" + config.password +
+                    "&expiration=" + config.tokenDurationMinutes.ToString() +
+                    "&f=pjson";
+                byte[] postBytes = UTF8Encoding.UTF8.GetBytes(postData);
+                authenticationReq.ContentLength = postBytes.Length;
+                using (Stream outputStream = authenticationReq.GetRequestStream())
+                {
+                    outputStream.Write(postBytes, 0, postBytes.Length);
+                }
+
+                // Read the authentication response
+                System.Net.HttpWebResponse authenticationResponse = null;
+                try
+                {
+                    authenticationResponse = (System.Net.HttpWebResponse)authenticationReq.GetResponse();
+                }
+                catch (System.Net.WebException)
+                {
+                    authenticationResponse = null;
+                }
+
+                if (authenticationResponse != null)
+                {
+                    try
+                    {
+                        using (Stream byteStream = authenticationResponse.GetResponseStream())
+                        {
+                            System.Runtime.Serialization.Json.DataContractJsonSerializer jsonSer =
+                                new System.Runtime.Serialization.Json.DataContractJsonSerializer(typeof(AuthenticationSpec));
+                            authSpec = (AuthenticationSpec)jsonSer.ReadObject(byteStream);
+                        }
+                    }
+                    catch(Exception ex)
+                    {
+                        authSpec = null;
+                    }
+                    authenticationResponse.Close();
+                }
+            }
+
+            // Cache the authentication
+            if (authSpec != null && null == authSpec.error)
+            {
+                DateTime expiresDate = new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc).AddMilliseconds(authSpec.expires);
+                HttpRuntime.Cache.Insert("authentication", authSpec, null, expiresDate, Cache.NoSlidingExpiration);
+
+                authExpiration = expiresDate.ToShortDateString() + " " + expiresDate.ToShortTimeString() + " UTC";//???
+            }
+            else
+            {
+                response.StatusCode = 500;
+                response.StatusDescription = "Authentication failed";
+                response.End();
+                return;
+            }
+        }
+
+        // Create the proxied URL
+        if (dataURL.Contains("?"))
+        {
+            // Check that the data URL doesn't contain extra question marks
+            int iQ = dataURL.IndexOf("?");
+            for (;;)
+            {
+                if(dataURL.Length <= ++iQ) break;
+                iQ = dataURL.IndexOf("?", iQ);
+                if(0 > iQ) break;
+                dataURL = dataURL.Remove(iQ, 1).Insert(iQ, "&");
+            };
+
+            if(authenticate)
+            {
+                dataURL += "&token=" + authSpec.token;
+            }
+        }
+        else if(authenticate)
+        {
+            dataURL += "?token=" + authSpec.token;
+        }
+
+        // Set up the user request
+        System.Net.HttpWebRequest proxiedReq = (System.Net.HttpWebRequest)System.Net.HttpWebRequest.Create(dataURL);
+        proxiedReq.Method = context.Request.HttpMethod;
+        proxiedReq.ServicePoint.Expect100Continue = false;
 
         // Set body of request for POST requests
         if (context.Request.InputStream.Length > 0)
         {
             byte[] bytes = new byte[context.Request.InputStream.Length];
             context.Request.InputStream.Read(bytes, 0, (int)context.Request.InputStream.Length);
-            req.ContentLength = bytes.Length;
+            proxiedReq.ContentLength = bytes.Length;
 
             string ctype = context.Request.ContentType;
             if (String.IsNullOrEmpty(ctype)) {
-              req.ContentType = "application/x-www-form-urlencoded";
+                proxiedReq.ContentType = "application/x-www-form-urlencoded";
             }
             else {
-              req.ContentType = ctype;
+                proxiedReq.ContentType = ctype;
             }
 
-            using (Stream outputStream = req.GetRequestStream())
+            using (Stream outputStream = proxiedReq.GetRequestStream())
             {
                 outputStream.Write(bytes, 0, bytes.Length);
             }
         }
 
-        // Send the request to the server
-        System.Net.WebResponse serverResponse = null;
+        // Send the user request to the server
+        System.Net.HttpWebResponse serverResponse = null;
         try
         {
-            serverResponse = req.GetResponse();
+            serverResponse = (System.Net.HttpWebResponse)proxiedReq.GetResponse();
         }
         catch (System.Net.WebException webExc)
         {
             response.StatusCode = 500;
             response.StatusDescription = webExc.Status.ToString();
+            response.Write(webExc.Message);
+            response.Write("<br />");
             response.Write(webExc.Response);
             response.End();
             return;
         }
 
         // Set up the response to the client
-        if (serverResponse != null) {
+        if (serverResponse != null)
+        {
             response.ContentType = serverResponse.ContentType;
-            using (Stream byteStream = serverResponse.GetResponseStream())
+            if(authenticate && cShowAuthXHeaders)//???
             {
-
-                // Text response
-                if (serverResponse.ContentType.Contains("text") ||
-                    serverResponse.ContentType.Contains("json"))
+                if(!usedCache) response.Headers["X-User"] = username;
+                response.Headers["X-Cached"] = usedCache.ToString();
+                response.Headers["X-AuthExpiration"] = authExpiration;
+            }
+            try
+            {
+                using (Stream byteStream = serverResponse.GetResponseStream())
                 {
-                    using (StreamReader sr = new StreamReader(byteStream))
+
+                    // Text response
+                    if (serverResponse.ContentType.Contains("text") ||
+                        serverResponse.ContentType.Contains("json"))
                     {
-                        string strResponse = sr.ReadToEnd();
-                        response.Write(strResponse);
+                        using (StreamReader sr = new StreamReader(byteStream))
+                        {
+                            string strResponse = sr.ReadToEnd();
+                            response.Write(strResponse);
+                        }
+                    }
+                    else
+                    {
+                        // Binary response (image, lyr file, other binary file)
+                        BinaryReader br = new BinaryReader(byteStream);
+
+                        // If the server provides the Content Length, use it.
+                        // But just because the value is zero doesn't mean that the server
+                        // didn't send us anything; cf ArcGIS.com & item thumbnails.
+                        int numBytes = (int)serverResponse.ContentLength;
+                        if (0 >= numBytes) numBytes = 4096;
+
+                        // Read until the response is empty
+                        int bytesRead = 0;
+                        do
+                        {
+                            byte[] outb = br.ReadBytes(numBytes);
+                            bytesRead = outb.Length;
+
+                            // Send the image to the client
+                            if (0 < bytesRead) response.OutputStream.Write(outb, 0, bytesRead);
+                        } while (0 < bytesRead);
+
+                        br.Close();
                     }
                 }
-                else
-                {
-                    // Binary response (image, lyr file, other binary file)
-                    BinaryReader br = new BinaryReader(byteStream);
-                    byte[] outb = br.ReadBytes((int)serverResponse.ContentLength);
-                    br.Close();
-
-                    // Tell client not to cache the image since it's dynamic
-                    response.CacheControl = "no-cache";
-
-                    // Send the image to the client
-                    // (Note: if large images/files sent, could modify this to send in chunks)
-                    response.OutputStream.Write(outb, 0, outb.Length);
-                }
-
-                serverResponse.Close();
             }
+            catch (Exception ex)
+            {
+                response.StatusCode = 500;
+                response.StatusDescription = ex.Message.ToString();
+                response.Write(ex.Message);
+            }
+            serverResponse.Close();
         }
+
         response.End();
     }
 
-    public bool IsReusable {
+    public bool IsReusable
+    {
         get {
             return false;
         }
     }
-
-    // Gets the token for a server URL from a configuration file
-    // TODO: ?modify so can generate a new short-lived token from username/password in the config file
-    private string getTokenFromConfigFile(string uri)
-    {
-        try
-        {
-            ProxyConfig config = ProxyConfig.GetCurrentConfig();
-            if (config != null)
-                return config.GetToken(uri);
-            else
-                throw new ApplicationException(
-                    "Proxy.config file does not exist at application root, or is not readable.");
-        }
-        catch (InvalidOperationException)
-        {
-            // Proxy is being used for an unsupported service (proxy.config has mustMatch="true")
-            HttpResponse response = HttpContext.Current.Response;
-            response.StatusCode = (int)System.Net.HttpStatusCode.Forbidden;
-            response.End();
-        }
-        catch (Exception e)
-        {
-            if (e is ApplicationException)
-                throw e;
-
-            // just return an empty string at this point
-            // -- may want to throw an exception, or add to a log file
-        }
-
-        return string.Empty;
-    }
 }
 
+//============================================================================================================================//
+
+/// <summary>
+/// Represents the contents of the config file and provides routines for accessing those contents.
+/// </summary>
 [XmlRoot("ProxyConfig")]
 public class ProxyConfig
 {
@@ -225,70 +384,55 @@ public class ProxyConfig
     }
     #endregion
 
-    ServerUrl[] serverUrls;
-    bool mustMatch;
 
-    [XmlArray("serverUrls")]
-    [XmlArrayItem("serverUrl")]
-    public ServerUrl[] ServerUrls
-    {
-        get { return this.serverUrls; }
-        set { this.serverUrls = value; }
-    }
+    [XmlElement("applicationURL")]
+    public string applicationURL;
 
-    [XmlAttribute("mustMatch")]
-    public bool MustMatch
-    {
-        get { return mustMatch; }
-        set { mustMatch = value; }
-    }
+    [XmlElement("authenticationUrl")]
+    public string authenticationUrl;
 
-    public string GetToken(string uri)
-    {
-        foreach (ServerUrl su in serverUrls)
-        {
-            if (su.MatchAll && uri.StartsWith(su.Url, StringComparison.InvariantCultureIgnoreCase))
-            {
-                return su.Token;
-            }
-            else
-            {
-                if (String.Compare(uri, su.Url, StringComparison.InvariantCultureIgnoreCase) == 0)
-                    return su.Token;
-            }
-        }
+    // http://stackoverflow.com/a/1052565
+    [XmlArray("dataUrlPrefixes")]
+    [XmlArrayItem("dataUrlPrefix")]
+    public dataUrlPrefix[] dataUrlPrefixes;
 
-        if (mustMatch)
-            throw new InvalidOperationException();
+    [XmlElement("username")]
+    public string username;
 
-        return string.Empty;
-    }
+    [XmlElement("password")]
+    public string password;
+
+    [XmlElement("tokenDurationMinutes")]
+    public int tokenDurationMinutes;
 }
 
-public class ServerUrl
+[XmlRoot("dataUrlPrefix")]
+public class dataUrlPrefix
 {
-    string url;
-    bool matchAll;
-    string token;
+    [XmlAttribute("authenticate")]
+    public string authenticate;
 
     [XmlAttribute("url")]
-    public string Url
-    {
-        get { return url; }
-        set { url = value; }
-    }
+    public string url;
+}
 
-    [XmlAttribute("matchAll")]
-    public bool MatchAll
-    {
-        get { return matchAll; }
-        set { matchAll = value; }
-    }
+//============================================================================================================================//
 
-    [XmlAttribute("token")]
-    public string Token
-    {
-        get { return token; }
-        set { token = value; }
-    }
+/// <summary>
+/// Represents the contents of the authentication specification returned from arcgis.com.
+/// </summary>
+[System.Runtime.Serialization.DataContract]
+public class AuthenticationSpec
+{
+    [System.Runtime.Serialization.DataMember]
+    public string token;
+
+    [System.Runtime.Serialization.DataMember]
+    public long expires;
+
+    [System.Runtime.Serialization.DataMember]
+    public bool ssl;
+
+    [System.Runtime.Serialization.DataMember]
+    public object error;
 }
